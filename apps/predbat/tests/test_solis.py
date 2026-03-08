@@ -45,6 +45,8 @@ class MockSolisAPI(SolisAPI):
         self.session = None
         self.nominal_voltage = 48.4
         self.control_enable = True
+        self.details_refresh_interval = 60
+        self.charge_discharge_refresh_interval = 60
         self.inverter_sn = []
 
         # Mock base object for get_arg calls
@@ -355,6 +357,7 @@ def run_solis_tests(my_predbat):
         failed |= asyncio.run(test_fetch_entity_data_power_clamping())
         failed |= asyncio.run(test_fetch_entity_data_invalid_values())
         failed |= asyncio.run(test_automatic_config())
+        failed |= asyncio.run(test_refresh_intervals())
 
     except Exception as e:
         print(f"Error running Solis tests: {e}")
@@ -2749,5 +2752,41 @@ async def test_automatic_config():
     assert any("No inverters to configure" in msg for msg in api3.log_messages), "Should log warning about no inverters"
 
     print("PASSED: automatic_config handles empty inverter list")
+
+    return False
+
+
+async def test_refresh_intervals():
+    """Test that refresh interval settings are rounded and clamped correctly"""
+    print("\n=== Test: refresh_intervals ===")
+
+    # Test defaults
+    api = MockSolisAPI()
+    assert api.details_refresh_interval == 60, f"Expected default 60, got {api.details_refresh_interval}"
+    assert api.charge_discharge_refresh_interval == 60, f"Expected default 60, got {api.charge_discharge_refresh_interval}"
+    print("PASSED: Default intervals are 60s")
+
+    # Test that initialize() rounds to multiples of 5 and clamps minimums
+    # Use a fresh MockBase to call initialize() directly
+    api2 = MockSolisAPI()
+    # Call initialize directly to test the rounding/clamping logic
+    SolisAPI.initialize(api2, api_key="k", api_secret="s", details_refresh_interval=33, charge_discharge_refresh_interval=47)
+    assert api2.details_refresh_interval == 35, f"Expected 33 rounded to 35, got {api2.details_refresh_interval}"
+    assert api2.charge_discharge_refresh_interval == 60, f"Expected 47 rounded to 45 then clamped to 60, got {api2.charge_discharge_refresh_interval}"
+    print("PASSED: Intervals are rounded to nearest 5")
+
+    # Test minimum clamping
+    api3 = MockSolisAPI()
+    SolisAPI.initialize(api3, api_key="k", api_secret="s", details_refresh_interval=10, charge_discharge_refresh_interval=30)
+    assert api3.details_refresh_interval == 30, f"Expected min 30, got {api3.details_refresh_interval}"
+    assert api3.charge_discharge_refresh_interval == 60, f"Expected min 60, got {api3.charge_discharge_refresh_interval}"
+    print("PASSED: Intervals are clamped to minimums (30s details, 60s charge/discharge)")
+
+    # Test larger values
+    api4 = MockSolisAPI()
+    SolisAPI.initialize(api4, api_key="k", api_secret="s", details_refresh_interval=120, charge_discharge_refresh_interval=300)
+    assert api4.details_refresh_interval == 120, f"Expected 120, got {api4.details_refresh_interval}"
+    assert api4.charge_discharge_refresh_interval == 300, f"Expected 300, got {api4.charge_discharge_refresh_interval}"
+    print("PASSED: Larger intervals are accepted as-is")
 
     return False

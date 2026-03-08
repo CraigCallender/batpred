@@ -290,6 +290,8 @@ COMPONENT_LIST = {
             "automatic": {"required": False, "config": "solis_automatic", "default": False},
             "base_url": {"required": False, "config": "solis_base_url", "default": "https://www.soliscloud.com:13333"},
             "control_enable": {"required": False, "config": "solis_control_enable", "default": True},
+            "details_refresh_interval": {"required": False, "config": "solis_details_refresh_interval", "default": 60},
+            "charge_discharge_refresh_interval": {"required": False, "config": "solis_charge_discharge_refresh_interval", "default": 60},
         },
         "phase": 1,
         "can_restart": True,

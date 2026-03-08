@@ -203,7 +203,7 @@ class SolisAPIError(Exception):
 class SolisAPI(ComponentBase):
     """Solis Cloud API integration component"""
 
-    def initialize(self, api_key, api_secret, inverter_sn=None, automatic=False, base_url=SOLIS_BASE_URL, control_enable=True):
+    def initialize(self, api_key, api_secret, inverter_sn=None, automatic=False, base_url=SOLIS_BASE_URL, control_enable=True, details_refresh_interval=60, charge_discharge_refresh_interval=60):
         """Initialize the Solis API component"""
         self.api_key = api_key
         self.api_secret = api_secret
@@ -212,6 +212,9 @@ class SolisAPI(ComponentBase):
         self.session = None
         self.nominal_voltage = 48.4  # Default nominal battery voltage
         self.control_enable = control_enable
+        # Round to nearest multiple of 5 (component loop ticks every 5s)
+        self.details_refresh_interval = max(30, int(round(int(details_refresh_interval) / 5) * 5))
+        self.charge_discharge_refresh_interval = max(60, int(round(int(charge_discharge_refresh_interval) / 5) * 5))
 
         # Convert inverter_sn to list
         if inverter_sn is None:
@@ -233,7 +236,7 @@ class SolisAPI(ComponentBase):
         # Tracking
         self.slots_reset = set()  # Track which inverters had slots reset
 
-        self.log(f"Solis API: Initialized with inverter_sn={self.inverter_sn} automatic={automatic}")
+        self.log(f"Solis API: Initialized with inverter_sn={self.inverter_sn} automatic={automatic} details_refresh={self.details_refresh_interval}s charge_discharge_refresh={self.charge_discharge_refresh_interval}s")
 
     # ==================== Helper Methods ====================
 
@@ -1982,6 +1985,24 @@ class SolisAPI(ComponentBase):
                 except (ValueError, TypeError):
                     self.log("Warn: Failed to convert battery capacity for {}: {}".format(inverter_sn, battery_capacity_ah))  # Debug log
 
+            # Data logger timestamp from inverterDetail API (shows when the data logger last reported to SolisCloud)
+            data_timestamp_ms = detail.get("dataTimestamp")
+            if data_timestamp_ms is not None:
+                try:
+                    data_timestamp_dt = datetime.fromtimestamp(int(data_timestamp_ms) / 1000, tz=UTC)
+                    self.dashboard_item(
+                        f"sensor.{prefix}_solis_{inverter_sn_lower}_data_timestamp",
+                        state=data_timestamp_dt.isoformat(),
+                        attributes={
+                            "friendly_name": f"Solis {inverter_name} Data Logger Timestamp",
+                            "device_class": "timestamp",
+                            "icon": "mdi:clock-check-outline",
+                        },
+                        app="solis"
+                    )
+                except (ValueError, TypeError, OSError):
+                    self.log(f"Warn: Failed to parse dataTimestamp for {inverter_sn}: {data_timestamp_ms}")
+
     # ==================== Control Methods ====================
 
     async def set_storage_mode_if_needed(self, inverter_sn, mode):
@@ -2673,15 +2694,15 @@ class SolisAPI(ComponentBase):
                 self.log("Error: Solis API: No inverters to manage after discovery")
                 return False # Stop further processing if no inverters
 
-        # Frequent polling (every minute)
-        if first or (seconds % 60 == 0):
+        # Frequent polling (configurable, default every 60s)
+        if first or (seconds % self.details_refresh_interval == 0):
             for sn in self.inverter_sn:
                 success =  await self.fetch_inverter_details(sn) # Get inverter details for all inverters
                 if not success:
                     poll_success = False
 
-        # Infrequent polling (every 60 minutes)
-        if first or (seconds % 3600 == 0):
+        # Charge/discharge settings polling (configurable, default every 60s)
+        if first or (seconds % self.charge_discharge_refresh_interval == 0):
             for sn in self.inverter_sn:
                 self.log(f"Solis API: Performing infrequent data poll for inverter {sn}...")
                 await self.poll_inverter_data(sn, SOLIS_CID_INFREQUENT)
@@ -2709,8 +2730,8 @@ class SolisAPI(ComponentBase):
                     else:
                         await self.fetch_entity_data(sn)
 
-        # Control mode
-        if first or (seconds % 60 == 0):
+        # Control mode (runs at the faster of the two refresh intervals)
+        if first or (seconds % min(self.details_refresh_interval, self.charge_discharge_refresh_interval) == 0):
             # Write to inverter using new function (handles both V1 and V2)
             is_readonly = self.get_state_wrapper(f'switch.{self.prefix}_set_read_only', default='off') == 'on'
             if self.control_enable and not is_readonly:
@@ -2720,8 +2741,8 @@ class SolisAPI(ComponentBase):
             else:
                 self.log("Solis API: Control disabled, skipping writing time windows")
 
-        # Publish entities after polling
-        if first or (seconds % 60 == 0):
+        # Publish entities after polling (runs at the faster of the two refresh intervals)
+        if first or (seconds % min(self.details_refresh_interval, self.charge_discharge_refresh_interval) == 0):
             await self.publish_entities()
 
         # Auto-configure Predbat if enabled
