@@ -203,7 +203,7 @@ class SolisAPIError(Exception):
 class SolisAPI(ComponentBase):
     """Solis Cloud API integration component"""
 
-    def initialize(self, api_key, api_secret, inverter_sn=None, automatic=False, base_url=SOLIS_BASE_URL, control_enable=True, details_refresh_interval=60, charge_discharge_refresh_interval=60):
+    def initialize(self, api_key, api_secret, inverter_sn=None, automatic=False, base_url=SOLIS_BASE_URL, control_enable=True, details_refresh_interval=60, charge_discharge_refresh_interval=300):
         """Initialize the Solis API component"""
         self.api_key = api_key
         self.api_secret = api_secret
