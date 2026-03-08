@@ -552,6 +552,8 @@ Integrates with Solis inverters for monitoring and controlling Solis battery sys
 | `automatic` | Boolean | No | False | `solis_automatic` | Set to `true` to automatically configure Predbat to use the Solis inverter (no manual apps.yaml sensor updates required) |
 | `base_url` | String | No | Auto-detected | `solis_base_url` | Solis Cloud API base URL (automatically selects correct region) |
 | `control_enable` | Boolean | No | True | `solis_control_enable` | Enable/disable control commands (set to false for monitoring only) |
+| `details_refresh_interval` | Integer | No | 60 | `solis_details_refresh_interval` | How often (in seconds) to poll inverter detail data from the Solis Cloud API. Minimum 30, rounded to nearest 5. Lower values give fresher sensor data but increase API usage |
+| `charge_discharge_refresh_interval` | Integer | No | 300 | `solis_charge_discharge_refresh_interval` | How often (in seconds) to poll charge/discharge CID settings and write any pending control changes. Minimum 60, rounded to nearest 5 |
 
 ---
 
