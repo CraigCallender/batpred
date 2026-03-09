@@ -17,6 +17,7 @@ from solis import SOLIS_CID_STORAGE_MODE, SOLIS_BIT_GRID_CHARGING, SOLIS_BIT_TOU
 from solis import SOLIS_CID_ALLOW_EXPORT, SOLIS_ALLOW_EXPORT_ON, SOLIS_ALLOW_EXPORT_OFF, SOLIS_CID_BATTERY_RESERVE_SOC
 from solis import SOLIS_CID_BATTERY_MAX_CHARGE_CURRENT
 from solis import SOLIS_CID_POWER_LIMIT, SOLIS_STORAGE_MODES, SOLIS_BIT_BACKUP_MODE
+from solis import SolisAPIError, SOLIS_NON_RETRYABLE_RESPONSE_CODES, SOLIS_API_CODES
 
 
 class MockBase:
@@ -62,12 +63,16 @@ class MockSolisAPI(SolisAPI):
         self.charge_discharge_time_windows = {}
         self.slots_reset = set()
 
+        # Rate limiting
+        self._last_request_time = 0.0
+
         # Logging
         self.log_messages = []
         self.dashboard_items = {}
 
         # Track method calls
         self.read_and_write_cid_calls = []
+        self.write_cid_calls = []
         self.set_storage_mode_calls = []
 
     def log(self, message):
@@ -101,6 +106,17 @@ class MockSolisAPI(SolisAPI):
     async def read_and_write_cid(self, inverter_sn, cid, value, field_description=None):
         """Mock read_and_write_cid - track calls"""
         self.read_and_write_cid_calls.append({"inverter_sn": inverter_sn, "cid": cid, "value": str(value), "field_description": field_description})  # Convert to string like real implementation
+
+        # Update cache to simulate successful write
+        if inverter_sn not in self.cached_values:
+            self.cached_values[inverter_sn] = {}
+        self.cached_values[inverter_sn][cid] = str(value)
+
+        return True
+
+    async def write_cid(self, inverter_sn, cid, value, old_value=None, field_description=None):
+        """Mock write_cid - track calls"""
+        self.write_cid_calls.append({"inverter_sn": inverter_sn, "cid": cid, "value": str(value), "old_value": str(old_value) if old_value is not None else None, "field_description": field_description})
 
         # Update cache to simulate successful write
         if inverter_sn not in self.cached_values:
@@ -357,6 +373,7 @@ def run_solis_tests(my_predbat):
         failed |= asyncio.run(test_fetch_entity_data_power_clamping())
         failed |= asyncio.run(test_fetch_entity_data_invalid_values())
         failed |= asyncio.run(test_automatic_config())
+        failed |= asyncio.run(test_non_retryable_api_response_codes())
         failed |= asyncio.run(test_refresh_intervals())
 
     except Exception as e:
@@ -721,6 +738,10 @@ async def test_write_cid():
     api = MockSolisAPI()
     inverter_sn = "TEST123456"
 
+    # Use the real write_cid implementation from SolisAPI (MockSolisAPI overrides it for tracking)
+    from solis import SolisAPI
+    api.write_cid = SolisAPI.write_cid.__get__(api, MockSolisAPI)
+
     # Track _execute_request calls
     execute_calls = []
 
@@ -1075,8 +1096,8 @@ async def test_write_time_windows_v2_mode():
     # Verify results
     assert result == True, "write_time_windows_if_changed should return True"
 
-    # Check that read_and_write_cid was called for all V2 fields
-    calls = api.read_and_write_cid_calls
+    # Check that write_cid was called for all V2 fields (uses cached old_value, no read-before-write)
+    calls = api.write_cid_calls
     # Should write: charge_enable, charge_time, charge_soc, charge_current, discharge_enable, discharge_time, discharge_soc, discharge_current
     # = 8 calls (not 10, since we only have discharge enable/time/soc/current, not a separate enable write)
     assert len(calls) == 8, f"Expected 8 calls for V2 mode (4 charge + 4 discharge fields), got {len(calls)}"
@@ -1166,9 +1187,9 @@ async def test_write_time_windows_v1_mode():
     # Verify results
     assert result == True, "write_time_windows_if_changed should return True"
 
-    # Check that read_and_write_cid was called for CID 103 only
+    # Check that write_cid was called for CID 103 only (uses cached old_value, no read-before-write)
     # V1 mode no longer writes global SOC values - it only encodes and writes CID 103
-    calls = api.read_and_write_cid_calls
+    calls = api.write_cid_calls
     assert len(calls) == 1, f"Expected 1 call for V1 mode (CID 103 only), got {len(calls)}"
 
     # Verify CID 103 was written
@@ -1224,8 +1245,8 @@ async def test_write_time_windows_v2_no_changes():
     # Verify results
     assert result == True, "write_time_windows_if_changed should return True"
 
-    # Check that read_and_write_cid was NOT called (no changes)
-    calls = api.read_and_write_cid_calls
+    # Check that write_cid was NOT called (no changes)
+    calls = api.write_cid_calls
     assert len(calls) == 0, f"Expected 0 calls when no changes, got {len(calls)}"
 
     # Verify storage mode was still set (always called)
@@ -2466,8 +2487,8 @@ async def test_set_storage_mode_self_use():
     # Call set_storage_mode with mode name
     await api.set_storage_mode(inverter_sn, "Self-Use")
 
-    # Verify read_and_write_cid was called
-    calls = api.read_and_write_cid_calls
+    # Verify write_cid was called (uses cached old_value)
+    calls = api.write_cid_calls
     assert len(calls) == 1, f"Expected 1 call, got {len(calls)}"
 
     # Verify correct CID and value
@@ -2494,8 +2515,8 @@ async def test_set_storage_mode_feed_in_priority():
     # Call set_storage_mode with mode name
     await api.set_storage_mode(inverter_sn, "Feed-in priority")
 
-    # Verify read_and_write_cid was called
-    calls = api.read_and_write_cid_calls
+    # Verify write_cid was called (uses cached old_value)
+    calls = api.write_cid_calls
     assert len(calls) == 1, f"Expected 1 call, got {len(calls)}"
 
     # Verify correct CID and value
@@ -2523,7 +2544,7 @@ async def test_set_storage_mode_unknown_mode():
     await api.set_storage_mode(inverter_sn, "Invalid Mode")
 
     # Verify no write was attempted
-    calls = api.read_and_write_cid_calls
+    calls = api.write_cid_calls
     assert len(calls) == 0, f"Expected 0 calls for unknown mode, got {len(calls)}"
 
     # Verify error was logged
@@ -2551,8 +2572,8 @@ async def test_set_storage_mode_if_needed_changes():
     # Call set_storage_mode_if_needed to change to Self-Use (35)
     await api.set_storage_mode_if_needed(inverter_sn, "Self-Use")
 
-    # Verify read_and_write_cid was called
-    calls = api.read_and_write_cid_calls
+    # Verify write_cid was called (uses cached old_value)
+    calls = api.write_cid_calls
     assert len(calls) == 1, f"Expected 1 call when mode changes, got {len(calls)}"
 
     # Verify correct CID and value
@@ -2582,7 +2603,7 @@ async def test_set_storage_mode_if_needed_no_changes():
     await api.set_storage_mode_if_needed(inverter_sn, "Self-Use")
 
     # Verify NO write was attempted
-    calls = api.read_and_write_cid_calls
+    calls = api.write_cid_calls
     assert len(calls) == 0, f"Expected 0 calls when mode unchanged, got {len(calls)}"
 
     print("PASSED: set_storage_mode_if_needed skips write when mode unchanged")
@@ -2613,13 +2634,13 @@ async def test_set_storage_mode_if_needed_all_modes():
 
     for mode_name, expected_value in test_modes:
         # Clear call log
-        api.read_and_write_cid_calls = []
+        api.write_cid_calls = []
 
         # Change mode
         await api.set_storage_mode_if_needed(inverter_sn, mode_name)
 
         # Verify write occurred
-        calls = api.read_and_write_cid_calls
+        calls = api.write_cid_calls
         assert len(calls) == 1, f"Expected 1 call for mode '{mode_name}', got {len(calls)}"
 
         # Verify correct value
@@ -2630,9 +2651,9 @@ async def test_set_storage_mode_if_needed_all_modes():
         api.cached_values[inverter_sn][SOLIS_CID_STORAGE_MODE] = expected_value
 
         # Call again - should NOT write (already set)
-        api.read_and_write_cid_calls = []
+        api.write_cid_calls = []
         await api.set_storage_mode_if_needed(inverter_sn, mode_name)
-        assert len(api.read_and_write_cid_calls) == 0, f"Should not write when {mode_name} already set"
+        assert len(api.write_cid_calls) == 0, f"Should not write when {mode_name} already set"
 
     print("PASSED: Multiple mode transitions handled correctly")
     return False
@@ -2752,6 +2773,125 @@ async def test_automatic_config():
     assert any("No inverters to configure" in msg for msg in api3.log_messages), "Should log warning about no inverters"
 
     print("PASSED: automatic_config handles empty inverter list")
+
+    return False
+
+
+async def test_non_retryable_api_response_codes():
+    """Test that known non-retryable API response codes (B0173, B0600, 1) are not retried,
+    while other error codes are retried normally."""
+    print("\n=== Test: non_retryable_api_response_codes ===")
+    import time
+
+    api = MockSolisAPI()
+    inverter_sn = "TEST123456"
+
+    # --- Verify SOLIS_API_CODES contains the new entries ---
+    assert "1" in SOLIS_API_CODES, "Missing code '1' in SOLIS_API_CODES"
+    assert "B0115" in SOLIS_API_CODES, "Missing code 'B0115' in SOLIS_API_CODES"
+    assert "B0173" in SOLIS_API_CODES, "Missing code 'B0173' in SOLIS_API_CODES"
+    assert "B0600" in SOLIS_API_CODES, "Missing code 'B0600' in SOLIS_API_CODES"
+    print("PASSED: SOLIS_API_CODES contains B0115, B0173, B0600, and 1")
+
+    # --- Verify SOLIS_NON_RETRYABLE_RESPONSE_CODES ---
+    assert "1" in SOLIS_NON_RETRYABLE_RESPONSE_CODES
+    assert "B0115" in SOLIS_NON_RETRYABLE_RESPONSE_CODES
+    assert "B0173" in SOLIS_NON_RETRYABLE_RESPONSE_CODES
+    assert "B0600" in SOLIS_NON_RETRYABLE_RESPONSE_CODES
+    # Success code should NOT be in the non-retryable set
+    assert "0" not in SOLIS_NON_RETRYABLE_RESPONSE_CODES
+    print("PASSED: SOLIS_NON_RETRYABLE_RESPONSE_CODES has expected codes")
+
+    # Mock time to avoid real delays
+    original_sleep = asyncio.sleep
+    original_monotonic = time.monotonic
+    mock_time = [0]
+
+    def mock_monotonic_gradual():
+        mock_time[0] += 0.1
+        return mock_time[0]
+
+    async def mock_sleep(delay):
+        pass
+
+    asyncio.sleep = mock_sleep
+    time.monotonic = mock_monotonic_gradual
+
+    try:
+        # --- Test each non-retryable response code: should fail immediately (1 call, no retries) ---
+        for code in ["1", "B0115", "B0173", "B0600"]:
+            call_count = [0]
+            mock_time[0] = 0
+
+            async def mock_execute_non_retryable(endpoint, payload, _code=code, _count=call_count):
+                _count[0] += 1
+                raise SolisAPIError(f"API error for code {_code}", response_code=_code)
+
+            api._execute_request = mock_execute_non_retryable
+
+            try:
+                await api.read_cid(inverter_sn, 103)
+                assert False, f"Should have raised SolisAPIError for code {code}"
+            except SolisAPIError as e:
+                assert e.response_code == code, f"Expected response_code={code}, got {e.response_code}"
+                assert call_count[0] == 1, f"Code {code}: Expected exactly 1 API call (no retries), got {call_count[0]}"
+                print(f"PASSED: API response code '{code}' is not retried (1 call)")
+
+        # --- Test that a retryable response code IS retried ---
+        call_count = [0]
+        mock_time[0] = 0
+
+        async def mock_execute_retryable(endpoint, payload):
+            call_count[0] += 1
+            raise SolisAPIError("API error: some retryable error", response_code="10500")
+
+        api._execute_request = mock_execute_retryable
+
+        try:
+            await api.read_cid(inverter_sn, 103)
+            assert False, "Should have raised SolisAPIError for retryable code"
+        except SolisAPIError:
+            assert call_count[0] > 1, f"Expected multiple calls for retryable code 10500, got {call_count[0]}"
+            print(f"PASSED: Retryable API code '10500' is retried ({call_count[0]} calls)")
+
+        # --- Test that HTTP 429 is still non-retryable ---
+        call_count = [0]
+        mock_time[0] = 0
+
+        async def mock_execute_http429(endpoint, payload):
+            call_count[0] += 1
+            raise SolisAPIError("Rate limited", status_code=429)
+
+        api._execute_request = mock_execute_http429
+
+        try:
+            await api.read_cid(inverter_sn, 103)
+            assert False, "Should have raised SolisAPIError for HTTP 429"
+        except SolisAPIError as e:
+            assert e.status_code == 429
+            assert call_count[0] == 1, f"Expected 1 call for HTTP 429, got {call_count[0]}"
+            print("PASSED: HTTP 429 is not retried (1 call)")
+
+        # --- Test that an error with both status_code and response_code checks status_code first ---
+        call_count = [0]
+        mock_time[0] = 0
+
+        async def mock_execute_both_codes(endpoint, payload):
+            call_count[0] += 1
+            raise SolisAPIError("Dual error", status_code=401, response_code="10500")
+
+        api._execute_request = mock_execute_both_codes
+
+        try:
+            await api.read_cid(inverter_sn, 103)
+            assert False, "Should have raised SolisAPIError"
+        except SolisAPIError as e:
+            assert call_count[0] == 1, f"Expected 1 call when status_code=401, got {call_count[0]}"
+            print("PASSED: HTTP status code takes precedence (non-retryable)")
+
+    finally:
+        asyncio.sleep = original_sleep
+        time.monotonic = original_monotonic
 
     return False
 

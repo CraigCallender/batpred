@@ -28,9 +28,13 @@ SOLIS_INVERTER_LIST_ENDPOINT = "/v1/api/inverterList"
 SOLIS_INVERTER_DETAIL_ENDPOINT = "/v1/api/inverterDetail"
 
 # Retry configuration
-SOLIS_MAX_RETRY_TIME = 30  # seconds
+SOLIS_MAX_RETRY_TIME = 10  # seconds
+SOLIS_MAX_RETRIES = 3  # maximum number of retry attempts
 SOLIS_INITIAL_RETRY_DELAY = 1  # seconds
 SOLIS_REQUEST_TIMEOUT = 30  # seconds
+
+# Rate limiting
+SOLIS_MIN_REQUEST_INTERVAL = 1.0  # minimum seconds between API calls
 
 # CID Constants (Control IDs for inverter registers)
 SOLIS_CID_STORAGE_MODE = 636
@@ -174,13 +178,22 @@ SOLIS_INVERTER_STATUS = {
 # API response codes
 SOLIS_API_CODES = {
     "0": "Success",
+    "1": "Communication error",
     "10001": "Operation failed",
     "10400": "Request not authenticated",
     "10401": "Unauthorized",
     "10403": "Forbidden",
     "10404": "Not found",
     "10500": "Internal server error",
+    "B0115": "Datalogger offline or disconnected",
+    "B0173": "Device timed out",
+    "B0600": "Datalogger data abnormal",
 }
+
+# API response codes that should NOT be retried.
+# These indicate the datalogger/device is temporarily unavailable;
+# retrying immediately just wastes API quota.
+SOLIS_NON_RETRYABLE_RESPONSE_CODES = {"1", "B0115", "B0173", "B0600"}
 
 # Time options for selectors (HH:MM:SS format)
 BASE_TIME = datetime(2000, 1, 1, 0, 0, 0)
@@ -235,6 +248,9 @@ class SolisAPI(ComponentBase):
 
         # Tracking
         self.slots_reset = set()  # Track which inverters had slots reset
+
+        # Rate limiting
+        self._last_request_time = 0.0  # monotonic time of last API call
 
         self.log(f"Solis API: Initialized with inverter_sn={self.inverter_sn} automatic={automatic} details_refresh={self.details_refresh_interval}s charge_discharge_refresh={self.charge_discharge_refresh_interval}s")
 
@@ -299,8 +315,16 @@ class SolisAPI(ComponentBase):
     # ==================== Core API Methods ====================
 
     async def _execute_request(self, endpoint, payload):
-        """Execute HTTP POST request to Solis API"""
+        """Execute HTTP POST request to Solis API with rate limiting"""
         url = f"{self.base_url}{endpoint}"
+
+        # Rate limit: ensure minimum interval between API calls
+        now = time.monotonic()
+        elapsed = now - self._last_request_time
+        if elapsed < SOLIS_MIN_REQUEST_INTERVAL:
+            await asyncio.sleep(SOLIS_MIN_REQUEST_INTERVAL - elapsed)
+        self._last_request_time = time.monotonic()
+
         headers = self._build_headers(endpoint, payload)
 
         try:
@@ -345,12 +369,24 @@ class SolisAPI(ComponentBase):
             try:
                 return await operation()
             except SolisAPIError as err:
+                attempt += 1
                 elapsed_time = time.monotonic() - start_time
-                if elapsed_time >= max_retry_time:
+
+                # Don't retry rate limit or auth errors
+                if err.status_code in (429, 401, 403):
+                    self.log(f"Warn: Solis API non-retryable error (HTTP {err.status_code}): {str(err)}")
                     raise err
 
-                attempt += 1
-                self.log(f"Warn: Solis API retry {attempt} after {elapsed_time:.1f}s: {str(err)}")
+                # Don't retry known non-retryable API response codes
+                # (device timeout, datalogger errors, communication errors)
+                if err.response_code in SOLIS_NON_RETRYABLE_RESPONSE_CODES:
+                    self.log(f"Warn: Solis API non-retryable error (API code {err.response_code}): {str(err)}")
+                    raise err
+
+                if attempt >= SOLIS_MAX_RETRIES or elapsed_time >= max_retry_time:
+                    raise err
+
+                self.log(f"Warn: Solis API retry {attempt}/{SOLIS_MAX_RETRIES} after {elapsed_time:.1f}s: {str(err)}")
 
                 await asyncio.sleep(delay)
                 delay = min(delay * 1.5, max_retry_time - elapsed_time)  # Exponential backoff
@@ -547,6 +583,9 @@ class SolisAPI(ComponentBase):
 
             if self.is_tou_v2_mode(inverter_sn):
                 # V2 mode: check and write individual registers for changed values only
+                # Use cached values as old_value (yuanzhi) for writes - we just polled these
+                # values via batch read, so they're current. This avoids individual read calls
+                # that would double the API call count.
                 slots_to_check = range(1, 7)
                 success = True
                 max_charge_current_amps = self.cached_values.get(inverter_sn, {}).get(SOLIS_CID_BATTERY_MAX_CHARGE_CURRENT, None)
@@ -569,7 +608,7 @@ class SolisAPI(ComponentBase):
                         new_enable_str = str(int(slot_data['charge_enable']))
                         cached_enable = self.cached_values.get(inverter_sn, {}).get(enable_cid)
                         if cached_enable != new_enable_str:
-                            result = await self.read_and_write_cid(inverter_sn, enable_cid, new_enable_str, field_description=f"charge slot {slot} enable")
+                            result = await self.write_cid(inverter_sn, enable_cid, new_enable_str, old_value=cached_enable, field_description=f"charge slot {slot} enable")
                             success &= result
 
                     # Check and write charge time if changed
@@ -578,7 +617,7 @@ class SolisAPI(ComponentBase):
                         new_time_str = f"{slot_data['charge_start_time']}-{slot_data['charge_end_time']}"
                         cached_time = self.cached_values.get(inverter_sn, {}).get(time_cid)
                         if cached_time != new_time_str:
-                            result = await self.read_and_write_cid(inverter_sn, time_cid, new_time_str, field_description=f"charge slot {slot} time")
+                            result = await self.write_cid(inverter_sn, time_cid, new_time_str, old_value=cached_time, field_description=f"charge slot {slot} time")
                             success &= result
 
                     # Check and write charge SOC if changed
@@ -587,7 +626,7 @@ class SolisAPI(ComponentBase):
                         new_soc_str = str(int(slot_data['charge_soc']))
                         cached_soc = self.cached_values.get(inverter_sn, {}).get(soc_cid)
                         if cached_soc != new_soc_str:
-                            result = await self.read_and_write_cid(inverter_sn, soc_cid, new_soc_str,field_description=f"charge slot {slot} SOC")
+                            result = await self.write_cid(inverter_sn, soc_cid, new_soc_str, old_value=cached_soc, field_description=f"charge slot {slot} SOC")
                             success &= result
 
                     # Check and write charge current if changed
@@ -596,7 +635,7 @@ class SolisAPI(ComponentBase):
                         new_current_str = str(int(slot_data['charge_current']))
                         cached_current = self.cached_values.get(inverter_sn, {}).get(current_cid)
                         if cached_current != new_current_str:
-                            result = await self.read_and_write_cid(inverter_sn, current_cid, new_current_str, field_description=f"charge slot {slot} current")
+                            result = await self.write_cid(inverter_sn, current_cid, new_current_str, old_value=cached_current, field_description=f"charge slot {slot} current")
                             success &= result
 
                     # Check and write discharge enable if changed
@@ -605,7 +644,7 @@ class SolisAPI(ComponentBase):
                         new_enable_str = str(int(slot_data['discharge_enable']))
                         cached_enable = self.cached_values.get(inverter_sn, {}).get(enable_cid)
                         if cached_enable != new_enable_str:
-                            result = await self.read_and_write_cid(inverter_sn, enable_cid, new_enable_str, field_description=f"discharge slot {slot} enable")
+                            result = await self.write_cid(inverter_sn, enable_cid, new_enable_str, old_value=cached_enable, field_description=f"discharge slot {slot} enable")
                             success &= result
 
                     # Check and write discharge time if changed
@@ -614,7 +653,7 @@ class SolisAPI(ComponentBase):
                         new_time_str = f"{slot_data['discharge_start_time']}-{slot_data['discharge_end_time']}"
                         cached_time = self.cached_values.get(inverter_sn, {}).get(time_cid)
                         if cached_time != new_time_str:
-                            result = await self.read_and_write_cid(inverter_sn, time_cid, new_time_str,field_description=f"discharge slot {slot} time")
+                            result = await self.write_cid(inverter_sn, time_cid, new_time_str, old_value=cached_time, field_description=f"discharge slot {slot} time")
                             success &= result
 
                     # Check and write discharge SOC if changed
@@ -623,7 +662,7 @@ class SolisAPI(ComponentBase):
                         new_soc_str = str(int(slot_data['discharge_soc']))
                         cached_soc = self.cached_values.get(inverter_sn, {}).get(soc_cid)
                         if cached_soc != new_soc_str:
-                            result = await self.read_and_write_cid(inverter_sn, soc_cid, new_soc_str, field_description=f"discharge slot {slot} SOC")
+                            result = await self.write_cid(inverter_sn, soc_cid, new_soc_str, old_value=cached_soc, field_description=f"discharge slot {slot} SOC")
                             success &= result
 
                     # Check and write discharge current if changed
@@ -632,7 +671,7 @@ class SolisAPI(ComponentBase):
                         new_current_str = str(int(slot_data['discharge_current']))
                         cached_current = self.cached_values.get(inverter_sn, {}).get(current_cid)
                         if cached_current != new_current_str:
-                            result = await self.read_and_write_cid(inverter_sn, current_cid, new_current_str,field_description=f"discharge slot {slot} current")
+                            result = await self.write_cid(inverter_sn, current_cid, new_current_str, old_value=cached_current, field_description=f"discharge slot {slot} current")
                             success &= result
 
                 # Decide if Solar charges the batter or exports
@@ -756,7 +795,7 @@ class SolisAPI(ComponentBase):
                 cached_encoded = self.cached_values.get(inverter_sn, {}).get(SOLIS_CID_CHARGE_DISCHARGE_SETTINGS)
 
                 if cached_encoded != encoded:
-                    result = await self.read_and_write_cid(inverter_sn, SOLIS_CID_CHARGE_DISCHARGE_SETTINGS, encoded, field_description="charge/discharge time windows")
+                    result = await self.write_cid(inverter_sn, SOLIS_CID_CHARGE_DISCHARGE_SETTINGS, encoded, old_value=cached_encoded, field_description="charge/discharge time windows")
                     success &= result
                 else:
                     self.log(f"Solis API: Time windows unchanged for {inverter_sn}, skipping SOLIS_CID_CHARGE_DISCHARGE_SETTINGS write")
@@ -2036,8 +2075,9 @@ class SolisAPI(ComponentBase):
                 self.log(f"Error: Unknown storage mode '{mode}' for {inverter_sn}")
                 return
 
-            # Write storage mode CID
-            success = await self.read_and_write_cid(inverter_sn, SOLIS_CID_STORAGE_MODE, mode_value, field_description=f"storage mode to {mode}")
+            # Write storage mode CID using cached old value
+            cached_mode = self.cached_values.get(inverter_sn, {}).get(SOLIS_CID_STORAGE_MODE)
+            success = await self.write_cid(inverter_sn, SOLIS_CID_STORAGE_MODE, mode_value, old_value=cached_mode, field_description=f"storage mode to {mode}")
             if not success:
                 self.log(f"Warn: Solis API set storage mode encountered errors for {inverter_sn}")
 
@@ -2694,8 +2734,8 @@ class SolisAPI(ComponentBase):
                 self.log("Error: Solis API: No inverters to manage after discovery")
                 return False # Stop further processing if no inverters
 
-        # Frequent polling (configurable, default every 60s)
-        if first or (seconds % self.details_refresh_interval == 0):
+        # Frequent polling (configurable, default every 60s) - skip on first as already done in startup
+        if (not first) and (seconds % self.details_refresh_interval == 0):
             for sn in self.inverter_sn:
                 success =  await self.fetch_inverter_details(sn) # Get inverter details for all inverters
                 if not success:
