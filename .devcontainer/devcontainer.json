@@ -43,10 +43,24 @@
 	// 		"onAutoForward": "notify"
 	// 	}
 	// },
-	// Passthrough of SSH key to devcontainer
+	// Ensure ~/.1password/agent.sock exists on the host before Docker tries to bind-mount it.
+	// - 1Password users: the real socket (or macOS symlink) is already there — this is a no-op.
+	// - Everyone else: a placeholder file is created so the mount succeeds; SSH will fail to
+	//   connect to the agent and silently fall back to key files in ~/.ssh.
+	// macOS one-time setup (stable symlink to the real 1Password socket):
+	//   mkdir -p ~/.1password && ln -sf ~/Library/Group\ Containers/2BUA8C4S2C.com.1password/t/agent.sock ~/.1password/agent.sock
+	// Linux: 1Password already writes the socket to ~/.1password/agent.sock by default.
+	// Windows: Enable the 1Password SSH agent in Settings → Developer.
+	"initializeCommand": "sh -c 'mkdir -p \"${HOME:-$USERPROFILE}/.1password\" && ([ -e \"${HOME:-$USERPROFILE}/.1password/agent.sock\" ] || touch \"${HOME:-$USERPROFILE}/.1password/agent.sock\")'",
 	"mounts": [
-		"type=bind,source=/home/${localEnv:USER}/.ssh,target=/home/vscode/.ssh,readonly"
+		"type=bind,source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/home/vscode/.ssh,readonly",
+		"type=bind,source=${localEnv:HOME}${localEnv:USERPROFILE}/.1password/agent.sock,target=/home/vscode/.1password/agent.sock"
 	],
+	// Point SSH_AUTH_SOCK at the mounted socket. If it's the real 1Password socket, agent auth
+	// works. If it's just a placeholder file, SSH ignores the agent and uses ~/.ssh key files.
+	"remoteEnv": {
+		"SSH_AUTH_SOCK": "/home/vscode/.1password/agent.sock"
+	},
 	// Use 'postCreateCommand' to run commands after the container is created.
 	"postCreateCommand": "pip install --upgrade pip && pip3 install -r requirements.txt"
 	// Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
