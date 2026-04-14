@@ -1170,7 +1170,7 @@ async def test_write_time_windows_v2_stale_slot_clearing():
     inverter_sn = "TEST_STALE"
     api.inverter_sn = [inverter_sn]
 
-    from solis import SOLIS_CID_DISCHARGE_TIME, SOLIS_CID_DISCHARGE_SOC, SOLIS_CID_DISCHARGE_CURRENT
+    from solis import SOLIS_CID_DISCHARGE_TIME
 
     # Desired state: slot 1 charge-active, everything else disabled/cleared
     api.charge_discharge_time_windows[inverter_sn] = {
