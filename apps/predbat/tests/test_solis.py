@@ -1200,11 +1200,13 @@ async def test_write_time_windows_v2_stale_slot_clearing():
         },
     }
 
-    # Cache reflects stale inverter state: slot 2 still has old active times
+    # Cache reflects stale inverter state: slot 2 still has old active times.
+    # Slot 1 charge time is STALE (03:00-06:00 != 02:00-05:00 desired) so Pass 2 must write it,
+    # giving us a concrete slot-1 active write to assert ordering against.
     api.cached_values[inverter_sn] = {
-        # Slot 1 charge - already correct in cache
+        # Slot 1 charge - enable/SOC/current already match, but time is STALE so Pass 2 must write it
         SOLIS_CID_CHARGE_ENABLE_BASE: "1",
-        SOLIS_CID_CHARGE_TIME[0]: "02:00-05:00",
+        SOLIS_CID_CHARGE_TIME[0]: "03:00-06:00",
         SOLIS_CID_CHARGE_SOC_BASE: "100",
         SOLIS_CID_CHARGE_CURRENT[0]: "50.0",
         # Slot 1 discharge - already cleared in cache
@@ -1232,16 +1234,18 @@ async def test_write_time_windows_v2_stale_slot_clearing():
     slot2_time_clear = next((c for c in calls if c["cid"] == SOLIS_CID_CHARGE_TIME[1] and c["value"] == "00:00-00:00"), None)
     assert slot2_time_clear is not None, "Pass 1 must clear stale slot 2 charge time"
 
-    # Verify ordering: both slot-2 clears must appear before any slot-1 active write
+    # Verify ordering: both slot-2 clears must appear before the slot-1 time write from Pass 2.
+    # Narrowing to SOLIS_CID_CHARGE_TIME[0] only ensures we only match the stale time update,
+    # not an enable write that might have come from Pass 1 (which doesn't write active slots).
     call_cids = [c["cid"] for c in calls]
     slot2_enable_idx = call_cids.index(SOLIS_CID_CHARGE_ENABLE_BASE + 1)
     slot2_time_idx = call_cids.index(SOLIS_CID_CHARGE_TIME[1])
-    # Slot 1 active writes (enable or time) should come after both clear writes
-    slot1_active_idxs = [i for i, c in enumerate(calls) if c["cid"] in (SOLIS_CID_CHARGE_ENABLE_BASE, SOLIS_CID_CHARGE_TIME[0])]
-    if slot1_active_idxs:
-        first_slot1_active = min(slot1_active_idxs)
-        assert slot2_enable_idx < first_slot1_active, "Slot 2 enable clear must precede slot 1 active write"
-        assert slot2_time_idx < first_slot1_active, "Slot 2 time clear must precede slot 1 active write"
+    # Slot 1 time write must exist (cache was stale) and must come after both Pass-1 clears
+    slot1_active_idxs = [i for i, c in enumerate(calls) if c["cid"] == SOLIS_CID_CHARGE_TIME[0]]
+    assert len(slot1_active_idxs) > 0, "Pass 2 must write slot 1 charge time (stale in cache)"
+    first_slot1_active = min(slot1_active_idxs)
+    assert slot2_enable_idx < first_slot1_active, "Slot 2 enable clear must precede slot 1 active write"
+    assert slot2_time_idx < first_slot1_active, "Slot 2 time clear must precede slot 1 active write"
 
     print("PASSED: V2 mode two-pass clears stale disabled slots before writing active slot")
     return False
