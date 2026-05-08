@@ -177,6 +177,7 @@ def test_ge_cloud(my_predbat=None):
         ("devices_ems", _test_async_get_devices_with_ems, "Get devices with EMS"),
         ("devices_gateway", _test_async_get_devices_with_gateway, "Get devices with Gateway"),
         ("devices_batteries", _test_async_get_devices_with_batteries, "Get devices with batteries"),
+        ("devices_legacy_battery", _test_async_get_devices_legacy_battery, "Get devices with legacy battery (empty connections)"),
         ("devices_empty", _test_async_get_devices_empty, "Get empty devices"),
         ("evc_devices", _test_async_get_evc_devices, "Get EV charger devices"),
         ("smart_devices", _test_async_get_smart_devices, "Get smart devices"),
@@ -621,8 +622,8 @@ def _test_async_get_devices_with_batteries(my_predbat):
         ge_cloud = MockGECloudDirect()
 
         mock_devices = [
-            {"inverter": {"serial": "inv001", "info": {"model": "All-In-One"}, "connections": {"batteries": [{"serial": "bat1"}]}}},
-            {"inverter": {"serial": "inv002", "info": {"model": "Hybrid"}, "connections": {"batteries": [{"serial": "bat2"}]}}},
+            {"inverter": {"serial": "inv001", "info": {"model": "All-In-One"}, "connections": {"batteries": [{"serial": "bat1"}], "meters": []}}},
+            {"inverter": {"serial": "inv002", "info": {"model": "Hybrid"}, "connections": {"batteries": [{"serial": "bat2"}], "meters": [{"serial_number": 12345}]}}},
         ]
 
         async def mock_retry(*args, **kwargs):
@@ -635,6 +636,59 @@ def _test_async_get_devices_with_batteries(my_predbat):
 
             if result["battery"] != ["inv001", "inv002"]:
                 print("ERROR: Expected battery=['inv001', 'inv002'], got {}".format(result))
+                return 1
+            # Verify battery_meters: inv001 has no meters, inv002 has meter serial 12345
+            if result["battery_meters"].get("inv001") != []:
+                print("ERROR: Expected battery_meters['inv001']=[], got {}".format(result["battery_meters"]))
+                return 1
+            if result["battery_meters"].get("inv002") != [12345]:
+                print("ERROR: Expected battery_meters['inv002']=[12345], got {}".format(result["battery_meters"]))
+                return 1
+        return 0
+
+    return run_async(test())
+
+
+def _test_async_get_devices_legacy_battery(my_predbat):
+    """Test device discovery with legacy inverter that has empty connections.batteries but has info.battery set (e.g. GIV-HY3.6)"""
+
+    async def test():
+        ge_cloud = MockGECloudDirect()
+
+        # Mirrors the real GIV-HY3.6 device structure seen in production
+        mock_devices = [
+            {
+                "serial_number": "WE1913G005",
+                "inverter": {
+                    "serial": "SA1919G001",
+                    "info": {
+                        "battery_type": "LITHIUM",
+                        "battery": {"nominal_capacity": 204, "nominal_voltage": 51.2, "depth_of_discharge": 1},
+                        "model": "GIV-HY3.6",
+                        "max_charge_rate": 2600,
+                        "max_discharge_rate": 2600,
+                    },
+                    "connections": {"batteries": [], "meters": []},
+                },
+            }
+        ]
+
+        async def mock_retry(*args, **kwargs):
+            return mock_devices
+
+        with patch("gecloud.asyncio.sleep", new_callable=AsyncMock):
+            ge_cloud.async_get_inverter_data_retry = mock_retry
+
+            result = await ge_cloud.async_get_devices()
+
+            if result["battery"] != ["sa1919g001"]:
+                print("ERROR: Expected battery=['sa1919g001'] for legacy device, got {}".format(result))
+                return 1
+            if result["ems"] is not None:
+                print("ERROR: Expected ems=None, got {}".format(result["ems"]))
+                return 1
+            if result["gateway"] is not None:
+                print("ERROR: Expected gateway=None, got {}".format(result["gateway"]))
                 return 1
         return 0
 
@@ -655,7 +709,7 @@ def _test_async_get_devices_empty(my_predbat):
 
             result = await ge_cloud.async_get_devices()
 
-            if result != {"gateway": None, "ems": None, "battery": []}:
+            if result != {"gateway": None, "ems": None, "battery": [], "battery_meters": {}}:
                 print("ERROR: Expected empty result dict, got {}".format(result))
                 return 1
         return 0
@@ -1874,13 +1928,14 @@ def _test_async_write_inverter_setting_success(my_predbat):
         with patch("gecloud.asyncio.sleep", new_callable=AsyncMock):
 
             async def mock_get_data(*args, **kwargs):
-                return {"success": True}
+                # Include a valid value (not an error code) so the write succeeds
+                return {"success": True, "value": 100}
 
             ge_cloud.async_get_inverter_data = mock_get_data
 
             result = await ge_cloud.async_write_inverter_setting("test123", 77, "100")
 
-            if result != {"success": True}:
+            if result != {"success": True, "value": 100}:
                 print("ERROR: Expected success response, got {}".format(result))
                 return 1
 
@@ -1894,8 +1949,31 @@ def _test_async_write_inverter_setting_success(my_predbat):
             if ge_cloud.pending_writes["test123"][0]["setting_id"] != 77:
                 print("ERROR: Expected setting_id 77, got {}".format(ge_cloud.pending_writes["test123"][0].get("setting_id")))
                 return 1
-            if ge_cloud.pending_writes["test123"][0]["value"] != "100":
+            if ge_cloud.pending_writes["test123"][0]["value"] != 100:
                 print("ERROR: Expected value 100, got {}".format(ge_cloud.pending_writes["test123"][0].get("value")))
+                return 1
+
+        # Test that a response with an error value code (-1) causes a retry and ultimately fails
+        ge_cloud2 = MockGECloudDirect()
+        ge_cloud2.pending_writes["test123"] = []
+
+        with patch("gecloud.asyncio.sleep", new_callable=AsyncMock):
+            call_count = [0]
+
+            async def mock_get_data_timeout(*args, **kwargs):
+                call_count[0] += 1
+                return {"success": True, "value": -1}  # Inverter timeout code
+
+            ge_cloud2.async_get_inverter_data = mock_get_data_timeout
+
+            result2 = await ge_cloud2.async_write_inverter_setting("test123", 77, "100")
+
+            if result2 is not None:
+                print("ERROR: Expected None when value is error code, got {}".format(result2))
+                return 1
+
+            if call_count[0] != 10:
+                print("ERROR: Expected 10 retry attempts for error value code, got {}".format(call_count[0]))
                 return 1
 
             return 0
@@ -2215,11 +2293,12 @@ def _test_publish_registers(my_predbat):
         56: {"name": "Enable AC Charge", "validation_rules": ["boolean"], "validation": "", "value": "1"},
         66: {"name": "Battery Reserve Percent Limit", "validation_rules": ["between:0,100"], "validation": "", "value": "20"},
         77: {"name": "AC Charge 1 Start Time", "validation_rules": ["date_format:H:i"], "validation": "", "value": "23:30:00"},
+        88: {"name": "Charge Power Rate", "validation_rules": ["between:0,100"], "validation": "", "value": "50"},
     }
 
     ge_cloud.register_list["test123"] = registers
 
-    ge_cloud.settings["test123"] = {56: "1", 66: "20", 77: "23:30:00"}
+    ge_cloud.settings["test123"] = {56: "1", 66: "20", 77: "23:30:00", 88: "50"}
 
     run_async(ge_cloud.publish_registers("test123", registers))
 
@@ -2236,6 +2315,19 @@ def _test_publish_registers(my_predbat):
     # Check select entity
     if "select.predbat_gecloud_test123_ac_charge_1_start_time" not in ge_cloud.dashboard_items:
         print("ERROR: Expected select entity to be published")
+        return 1
+
+    # Check power rate number entity has percent attributes
+    entity_id = "number.predbat_gecloud_test123_charge_power_rate"
+    if entity_id not in ge_cloud.dashboard_items:
+        print("ERROR: Expected charge power rate number entity to be published")
+        return 1
+    attrs = ge_cloud.dashboard_items[entity_id]["attributes"]
+    if attrs.get("unit_of_measurement") != "%":
+        print("ERROR: Expected charge power rate unit '%', got '{}'".format(attrs.get("unit_of_measurement")))
+        return 1
+    if attrs.get("device_class") != "power_factor":
+        print("ERROR: Expected charge power rate device_class 'power_factor', got '{}'".format(attrs.get("device_class")))
         return 1
 
     return 0
@@ -2331,7 +2423,20 @@ def _test_async_automatic_config(my_predbat):
         ge.config_args = {}
 
         # Test 1: Single battery with all features
-        ge.settings = {"battery001": {"reg1": {"name": "Inverter_Charge_Power_Percentage"}, "reg2": {"name": "Pause_Battery"}, "reg3": {"name": "Pause_Battery_Start_Time"}, "reg4": {"name": "DC_Discharge_1_Lower_SOC_Percent_Limit"}}}
+        ge.settings = {
+            "battery001": {
+                "reg1": {"name": "Inverter_Charge_Power_Percentage"},
+                "reg2": {"name": "Pause_Battery"},
+                "reg3": {"name": "Pause_Battery_Start_Time"},
+                "reg4": {"name": "DC_Discharge_1_Lower_SOC_Percent_Limit"},
+                "reg5": {"name": "Enable_Eco_Mode"},
+                "reg6": {"name": "Battery_Charge_Power"},
+                "reg7": {"name": "Battery_Discharge_Power"},
+                "reg8": {"name": "Battery_Reserve_Percent_Limit"},
+                "reg9": {"name": "AC_Charge_Upper_Percent_Limit"},
+                "reg10": {"name": "Inverter_Discharge_Power_Percentage"},
+            }
+        }
 
         devices = {"ems": None, "gateway": None, "battery": ["battery001"]}
 
@@ -2391,11 +2496,13 @@ def _test_async_automatic_config(my_predbat):
         assert ge.config_args.get("discharge_target_soc") is None, "discharge_target_soc should be None"
         assert ge.config_args.get("charge_rate_percent") is None, "charge_rate_percent should be None"
         assert ge.config_args.get("discharge_rate_percent") is None, "discharge_rate_percent should be None"
-        assert ge.config_args.get("inverter_mode") == ["switch.predbat_gecloud_battery002_enable_eco_mode"], "inverter_mode should point to eco toggle switch"
+        assert ge.config_args.get("inverter_mode") is None, "inverter_mode should be None when eco toggle switch is not available"
 
-        # Test 3: Multiple batteries
+        # Test 3: Multiple batteries with no battery_meters (default: shared CT — no dedicated meters detected)
+        # When battery_meters is absent or all batteries have empty meters, shared CT is assumed and
+        # grid/load sensors should use only the first battery to avoid double-counting.
         ge.config_args = {}
-        ge.settings = {"battery001": {}, "battery002": {}}
+        ge.settings = {"battery001": {"reg1": {"name": "Enable_Eco_Mode"}}, "battery002": {"reg1": {"name": "Enable_Eco_Mode"}}}
 
         devices = {"ems": None, "gateway": None, "battery": ["battery001", "battery002"]}
 
@@ -2403,10 +2510,78 @@ def _test_async_automatic_config(my_predbat):
 
         assert ge.config_args.get("num_inverters") == 2, "num_inverters should be 2"
         assert ge.config_args.get("inverter_type") == ["GEC", "GEC"], "inverter_type should have 2 entries"
-        assert len(ge.config_args.get("load_today")) == 2, "load_today should have 2 entries"
-        assert ge.config_args.get("load_today")[0] == "sensor.predbat_gecloud_battery001_consumption_total"
-        assert ge.config_args.get("load_today")[1] == "sensor.predbat_gecloud_battery002_consumption_total"
+        # Shared CT: load_today, import_today, export_today use first battery only to avoid double-counting
+        assert ge.config_args.get("load_today") == ["sensor.predbat_gecloud_battery001_consumption_total"], "load_today should use first battery only (shared CT)"
+        assert ge.config_args.get("import_today") == ["sensor.predbat_gecloud_battery001_grid_import_total"], "import_today should use first battery only (shared CT)"
+        assert ge.config_args.get("export_today") == ["sensor.predbat_gecloud_battery001_grid_export_total"], "export_today should use first battery only (shared CT)"
+        # Shared CT: grid_power and load_power use first battery + zeros
+        assert ge.config_args.get("grid_power") == ["sensor.predbat_gecloud_battery001_grid_power", 0], "grid_power should use first battery + zero (shared CT)"
+        assert ge.config_args.get("load_power") == ["sensor.predbat_gecloud_battery001_consumption_power", 0], "load_power should use first battery + zero (shared CT)"
+        # Per-inverter sensors should still use all batteries
+        assert ge.config_args.get("pv_today") == ["sensor.predbat_gecloud_battery001_solar_total", "sensor.predbat_gecloud_battery002_solar_total"], "pv_today should use all batteries"
+        assert ge.config_args.get("battery_power") == ["sensor.predbat_gecloud_battery001_battery_power", "sensor.predbat_gecloud_battery002_battery_power"], "battery_power should use all batteries"
         assert ge.config_args.get("inverter_mode") == ["switch.predbat_gecloud_battery001_enable_eco_mode", "switch.predbat_gecloud_battery002_enable_eco_mode"], "inverter_mode should have 2 eco toggle entries"
+
+        # Test 3b: Multiple batteries with unique dedicated meters (independent CT clamps)
+        # When each battery has a distinct dedicated meter serial, per-inverter readings are used.
+        ge.config_args = {}
+        ge.settings = {"battery001": {"reg1": {"name": "Enable_Eco_Mode"}}, "battery002": {"reg1": {"name": "Enable_Eco_Mode"}}}
+
+        devices = {
+            "ems": None,
+            "gateway": None,
+            "battery": ["battery001", "battery002"],
+            "battery_meters": {"battery001": [1001], "battery002": [1002]},
+        }
+
+        await ge.async_automatic_config(devices)
+
+        assert ge.config_args.get("num_inverters") == 2, "num_inverters should be 2 with unique meters"
+        # Unique meters: all sensors use both batteries (no shared-CT fixup applied)
+        assert ge.config_args.get("import_today") == ["sensor.predbat_gecloud_battery001_grid_import_total", "sensor.predbat_gecloud_battery002_grid_import_total"], "import_today should use both batteries when meters are unique"
+        assert ge.config_args.get("export_today") == ["sensor.predbat_gecloud_battery001_grid_export_total", "sensor.predbat_gecloud_battery002_grid_export_total"], "export_today should use both batteries when meters are unique"
+        assert ge.config_args.get("grid_power") == ["sensor.predbat_gecloud_battery001_grid_power", "sensor.predbat_gecloud_battery002_grid_power"], "grid_power should use both batteries when meters are unique"
+
+        # Test 3c: Multiple batteries with shared/duplicate meter serial (same CT clamp explicitly detected)
+        ge.config_args = {}
+        ge.settings = {"battery001": {"reg1": {"name": "Enable_Eco_Mode"}}, "battery002": {"reg1": {"name": "Enable_Eco_Mode"}}}
+
+        devices = {
+            "ems": None,
+            "gateway": None,
+            "battery": ["battery001", "battery002"],
+            "battery_meters": {"battery001": [9999], "battery002": [9999]},  # same serial = shared meter
+        }
+
+        await ge.async_automatic_config(devices)
+
+        assert ge.config_args.get("grid_power") == ["sensor.predbat_gecloud_battery001_grid_power", 0], "grid_power should use first battery + zero when meter serial is shared"
+        assert ge.config_args.get("import_today") == ["sensor.predbat_gecloud_battery001_grid_import_total"], "import_today should use first battery only when meter serial is shared"
+
+        # Test 3d: Three-phase alternative names should be auto-selected when default names do not exist
+        ge.config_args = {}
+        ge.settings = {
+            "battery003": {
+                "reg1": {"name": "Charge_Power_Rate"},
+                "reg2": {"name": "Discharge_Power_Rate"},
+                "reg3": {"name": "Battery_Reserve_Percent"},
+                "reg4": {"name": "AC_Charge_1_Upper_SOC_Percent_Limit"},
+                "reg5": {"name": "Enable_AC_Charge"},
+                "reg6": {"name": "Enable_Force_Discharge"},
+            }
+        }
+        devices = {"ems": None, "gateway": None, "battery": ["battery003"]}
+        await ge.async_automatic_config(devices)
+
+        assert ge.config_args.get("charge_rate") is None
+        assert ge.config_args.get("discharge_rate") is None
+        assert ge.config_args.get("charge_rate_percent") == ["number.predbat_gecloud_battery003_charge_power_rate"]
+        assert ge.config_args.get("discharge_rate_percent") == ["number.predbat_gecloud_battery003_discharge_power_rate"]
+        assert ge.config_args.get("reserve") == ["number.predbat_gecloud_battery003_battery_reserve_percent"]
+        assert ge.config_args.get("charge_limit") == ["number.predbat_gecloud_battery003_ac_charge_1_upper_soc_percent_limit"]
+        assert ge.config_args.get("scheduled_charge_enable") == ["switch.predbat_gecloud_battery003_enable_ac_charge"]
+        assert ge.config_args.get("scheduled_discharge_enable") == ["switch.predbat_gecloud_battery003_enable_force_discharge"]
+        assert ge.config_args.get("inverter_mode") is None, "inverter_mode should be None when eco toggle is not available"
 
         # Test 4: EMS configuration
         ge.config_args = {}
@@ -2820,6 +2995,32 @@ def _test_enable_default_options(my_predbat):
             return 1
         if write_calls[0]["value"] != 100:
             print("ERROR: Expected value=100 for upper SOC limit, got {}".format(write_calls[0]["value"]))
+            return 1
+
+        # Test 20: Charge Up To Percent needs fixing
+        write_calls = []
+        registers = {222: {"name": "Charge_Up_To_Percent", "value": 80, "validation_rules": []}}
+
+        result = await ge_cloud.enable_default_options("test123", registers)
+
+        if not result:
+            print("ERROR: enable_default_options should return True when setting charge up to percent")
+            return 1
+        if write_calls[0]["value"] != 100:
+            print("ERROR: Expected value=100 for charge up to percent, got {}".format(write_calls[0]["value"]))
+            return 1
+
+        # Test 21: Discharge Down To Percent needs fixing
+        write_calls = []
+        registers = {223: {"name": "Discharge_Down_To_Percent", "value": 15, "validation_rules": []}}
+
+        result = await ge_cloud.enable_default_options("test123", registers)
+
+        if not result:
+            print("ERROR: enable_default_options should return True when setting discharge down to percent")
+            return 1
+        if write_calls[0]["value"] != 4:
+            print("ERROR: Expected value=4 for discharge down to percent, got {}".format(write_calls[0]["value"]))
             return 1
 
         return 0

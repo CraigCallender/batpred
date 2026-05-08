@@ -18,11 +18,41 @@ personal API tiers.
 
 import hashlib
 import json
+import math
 import os
 import aiohttp
 import traceback
 import pytz
 from datetime import datetime, timedelta, timezone
+
+try:
+    from pvlib.temperature import sapm_cell as _pvlib_sapm_cell
+    from pvlib.temperature import TEMPERATURE_MODEL_PARAMETERS as _PVLIB_TEMP_PARAMS
+
+    _PVLIB_SAPM_PARAMS = _PVLIB_TEMP_PARAMS["sapm"]["open_rack_glass_glass"]
+    _HAS_PVLIB = True
+except ImportError:
+    _HAS_PVLIB = False
+
+# PVWatts / SAPM cell temperature model constants (glass/glass, open rack)
+_SAPM_A = -3.47
+_SAPM_B = -0.0594
+_SAPM_DELTA_T = 3.0
+
+
+def pvwatts_cell_temperature(poa_global, temp_air, wind_speed):
+    """Compute PV cell temperature using the SAPM (PVWatts) model.
+
+    Uses pvlib.temperature.sapm_cell when available; falls back to the
+    equivalent inline formula otherwise.  Parameters correspond to a
+    glass/glass module on an open rack (the most common residential case).
+    """
+    if _HAS_PVLIB:
+        return float(_pvlib_sapm_cell(poa_global, temp_air, wind_speed, _PVLIB_SAPM_PARAMS["a"], _PVLIB_SAPM_PARAMS["b"], _PVLIB_SAPM_PARAMS["deltaT"]))
+    # Inline SAPM formula: T_cell = T_air + GTI * exp(a + b*wind) + (GTI/1000) * deltaT
+    return temp_air + poa_global * math.exp(_SAPM_A + _SAPM_B * wind_speed) + (poa_global / 1000.0) * _SAPM_DELTA_T
+
+
 from const import TIME_FORMAT, TIME_FORMAT_SOLCAST
 from utils import dp1, dp2, dp4, history_attribute_to_minute_data, minute_data, history_attribute, prune_today
 from predbat_metrics import record_api_call, metrics
@@ -45,7 +75,22 @@ class SolarAPI(ComponentBase):
     for system optimisation and decision-making.
     """
 
-    def initialize(self, solcast_host, solcast_api_key, solcast_sites, solcast_poll_hours, forecast_solar, forecast_solar_max_age, pv_forecast_today, pv_forecast_tomorrow, pv_forecast_d3, pv_forecast_d4, pv_scaling):
+    def initialize(
+        self,
+        solcast_host,
+        solcast_api_key,
+        solcast_sites,
+        solcast_poll_hours,
+        forecast_solar,
+        forecast_solar_max_age,
+        pv_forecast_today,
+        pv_forecast_tomorrow,
+        pv_forecast_d3,
+        pv_forecast_d4,
+        pv_scaling,
+        open_meteo_forecast,
+        open_meteo_forecast_max_age,
+    ):
         """Initialise the Solar API component"""
         self.solcast_host = solcast_host
         self.solcast_api_key = solcast_api_key
@@ -58,12 +103,17 @@ class SolarAPI(ComponentBase):
         self.pv_forecast_d3 = pv_forecast_d3
         self.pv_forecast_d4 = pv_forecast_d4
         self.pv_scaling = pv_scaling
+        self.open_meteo_forecast = open_meteo_forecast
+        self.open_meteo_forecast_max_age = open_meteo_forecast_max_age
         self.solcast_requests_total = 0
         self.solcast_failures_total = 0
         self.forecast_solar_requests_total = 0
         self.forecast_solar_failures_total = 0
+        self.open_meteo_requests_total = 0
+        self.open_meteo_failures_total = 0
         self.solcast_last_success_timestamp = None
         self.forecast_solar_last_success_timestamp = None
+        self.open_meteo_last_success_timestamp = None
         self.last_fetched_timestamp = None
         self.forecast_days = 4
 
@@ -87,6 +137,7 @@ class SolarAPI(ComponentBase):
         # Check if this is a Solcast API call for metrics tracking
         is_solcast_api = "solcast.com" in url.lower() or "api.solcast" in url.lower()
         is_forecast_solar_api = "forecast.solar" in url.lower()
+        is_open_meteo_api = "open-meteo.com" in url.lower()
 
         # Increment request counter for Solcast API calls
         if is_solcast_api:
@@ -95,6 +146,10 @@ class SolarAPI(ComponentBase):
         # Increment request counter for forecast.solar API calls
         if is_forecast_solar_api:
             self.forecast_solar_requests_total += 1
+
+        # Increment request counter for Open-Meteo API calls
+        if is_open_meteo_api:
+            self.open_meteo_requests_total += 1
 
         # Get data from cache
         age_minutes = 0
@@ -139,6 +194,9 @@ class SolarAPI(ComponentBase):
                         if is_forecast_solar_api:
                             self.forecast_solar_failures_total += 1
                             record_api_call("forecast_solar", False, "server_error")
+                        if is_open_meteo_api:
+                            self.open_meteo_failures_total += 1
+                            record_api_call("open_meteo", False, "server_error")
                         return data
 
                     try:
@@ -149,6 +207,9 @@ class SolarAPI(ComponentBase):
                         if is_forecast_solar_api:
                             self.forecast_solar_last_success_timestamp = datetime.now(timezone.utc)
                             record_api_call("forecast_solar")
+                        if is_open_meteo_api:
+                            self.open_meteo_last_success_timestamp = datetime.now(timezone.utc)
+                            record_api_call("open_meteo")
                     except (aiohttp.ContentTypeError, Exception) as e:
                         self.log("Warn: Error downloading data from URL {}, error {} code {}".format(url, e, status_code))
                         if is_solcast_api:
@@ -157,6 +218,9 @@ class SolarAPI(ComponentBase):
                         if is_forecast_solar_api:
                             self.forecast_solar_failures_total += 1
                             record_api_call("forecast_solar", False, "decode_error")
+                        if is_open_meteo_api:
+                            self.open_meteo_failures_total += 1
+                            record_api_call("open_meteo", False, "decode_error")
                         if data:
                             self.log("Warn: Error downloading data from URL {}, using cached data age {} minutes".format(url, dp1(age_minutes)))
                         else:
@@ -169,6 +233,9 @@ class SolarAPI(ComponentBase):
             if is_forecast_solar_api:
                 self.forecast_solar_failures_total += 1
                 record_api_call("forecast_solar", False, "connection_error")
+            if is_open_meteo_api:
+                self.open_meteo_failures_total += 1
+                record_api_call("open_meteo", False, "connection_error")
             return data
 
         # Store data in cache
@@ -183,9 +250,9 @@ class SolarAPI(ComponentBase):
 
     def convert_azimuth(self, az):
         """
-        Convert azimuth from solcast format to forecast solar format
-        solcast format is        0 = North, -90 = East, 90 = West, 180 = South
-        forecast solar format is 0 = South, -90 = East, 90 = West, 180 = North
+        Convert azimuth from Predbat/Solcast convention to Forecast.solar/Open-Meteo convention.
+        Predbat/Solcast convention:         0 = North, -90 = East, 90 = West, 180 = South
+        Forecast.solar/Open-Meteo convention: 0 = South, -90 = East, 90 = West, ±180 = North
         """
         if az >= 0:
             az = 180 - az
@@ -194,11 +261,172 @@ class SolarAPI(ComponentBase):
 
         return az
 
+    async def download_open_meteo_ensemble_data(self, lat, lon, tilt, az, kwp, system_loss):
+        """
+        Download Open-Meteo ensemble data for P10 solar estimate.
+        Returns a dict mapping ISO timestamp strings to P10 kW values.
+        """
+        url = "https://ensemble-api.open-meteo.com/v1/ensemble?models=icon_seamless&latitude={lat}&longitude={lon}&hourly=global_tilted_irradiance&tilt={tilt}&azimuth={az}&forecast_days=4&timezone=UTC".format(lat=lat, lon=lon, tilt=tilt, az=az)
+        data = await self.cache_get_url(url, params={}, max_age=self.open_meteo_forecast_max_age * 60)
+        if not data:
+            return {}
+
+        hourly = data.get("hourly", {})
+        times = hourly.get("time", [])
+        member_keys = [k for k in hourly if k.startswith("global_tilted_irradiance_member")]
+        if not member_keys or not times:
+            return {}
+
+        result = {}
+        for idx, ts in enumerate(times):
+            values = []
+            for k in member_keys:
+                val = hourly[k][idx] if idx < len(hourly[k]) else None
+                if val is not None:
+                    values.append(val)
+            if not values:
+                result[ts] = 0.0
+                continue
+            values.sort()
+            p10_idx = max(0, math.ceil(len(values) * 0.10) - 1)
+            gti_p10 = values[p10_idx]
+            result[ts] = dp4((gti_p10 / 1000.0) * kwp * (1.0 - system_loss))
+        return result
+
+    async def download_open_meteo_data(self):
+        """
+        Download Open-Meteo forecast data and convert to PV power estimates.
+        Uses GTI (global tilted irradiance) with simple temperature derating for P50,
+        and ensemble members for P10. Returns (sorted_data, max_kwh).
+        """
+        period_data = {}
+        max_kwh = 0
+
+        configs = self.open_meteo_forecast
+        if configs is None:
+            raise ValueError("SolarAPI: No Open-Meteo forecast configurations found")
+        if not isinstance(configs, list):
+            configs = [configs]
+
+        for config in configs:
+            lat = config.get("latitude", 51.5072)
+            lon = config.get("longitude", -0.1276)
+            postcode = config.get("postcode", None)
+            tilt = config.get("declination", 35.0)
+            az = config.get("azimuth", 180.0)
+            az = self.convert_azimuth(az)
+            kwp = config.get("kwp", 3.0)
+            system_loss = 1.0 - config.get("efficiency", 0.95)
+            shading_factors = config.get("shading_factors", None)
+
+            if shading_factors and len(shading_factors) == 12:
+                self.log("Open-Meteo: Using per-month shading factors for lat {} lon {}".format(lat, lon))
+
+            max_kwh += kwp * (1.0 - system_loss)
+
+            if postcode:
+                postcode_data = await self.cache_get_url("https://api.postcodes.io/postcodes/{}".format(postcode), params={}, max_age=24 * 60 * 30)
+                if postcode_data:
+                    postcode_result = postcode_data.get("result", {})
+                    if "longitude" in postcode_result and "latitude" in postcode_result:
+                        lon = postcode_result.get("longitude", lon)
+                        lat = postcode_result.get("latitude", lat)
+                        self.log("Postcode {} resolved to latitude {} longitude {}".format(postcode, lat, lon))
+                    else:
+                        self.log("Warn: Postcode {} could not be resolved to latitude and longitude, using default".format(postcode))
+
+            url = "https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=global_tilted_irradiance,temperature_2m,wind_speed_10m&wind_speed_unit=ms&tilt={tilt}&azimuth={az}&forecast_days=4&timezone=UTC".format(
+                lat=lat, lon=lon, tilt=tilt, az=az
+            )
+            data = await self.cache_get_url(url, params={}, max_age=self.open_meteo_forecast_max_age * 60)
+            if not data:
+                self.log("Warn: Open-Meteo data for lat {} lon {} could not be downloaded".format(lat, lon))
+                continue
+
+            hourly = data.get("hourly", {})
+            times = hourly.get("time", [])
+            gti_values = hourly.get("global_tilted_irradiance", [])
+            temp_values = hourly.get("temperature_2m", [])
+            wind_values = hourly.get("wind_speed_10m", [])
+
+            if not times or not gti_values:
+                self.log("Warn: Open-Meteo data for lat {} lon {} has no hourly data".format(lat, lon))
+                continue
+
+            ensemble_p10 = await self.download_open_meteo_ensemble_data(lat, lon, tilt, az, kwp, system_loss)
+
+            # Pass 1: compute instantaneous kW at each UTC timestamp sample.
+            # Open-Meteo returns point-in-time irradiance (W/m²) at the start of each hour,
+            # so we must integrate over the period rather than treating the sample as the period energy.
+            instant_kw = {}  # datetime stamp -> (pv50_kw, pv10_kw)
+            instant_stamps = []
+            for idx, ts in enumerate(times):
+                if idx >= len(gti_values):
+                    break
+                gti = gti_values[idx]
+                if gti is None:
+                    gti = 0.0
+                temp = temp_values[idx] if idx < len(temp_values) and temp_values[idx] is not None else 25.0
+                wind = wind_values[idx] if idx < len(wind_values) and wind_values[idx] is not None else 1.0
+                # Cell temperature via SAPM/PVWatts model: irradiance heats the cell above ambient
+                t_cell = pvwatts_cell_temperature(gti, temp, wind)
+                # c-Si temperature coefficient: -0.4%/°C relative to STC (25°C)
+                # No lower clamp on (t_cell - 25): cool cells genuinely produce more power.
+                # Cap at 1.1 (10% above STC) to prevent unrealistic gains at very cold temperatures.
+                eta_temp = max(0.5, min(1.1, 1.0 - 0.004 * (t_cell - 25.0)))
+                pv50_inst = dp4((gti / 1000.0) * kwp * eta_temp * (1.0 - system_loss))
+                raw_p10 = ensemble_p10.get(ts)
+                # ensemble_p10 was computed without temperature derating; apply eta_temp now
+                pv10_inst = dp4(min(raw_p10 * eta_temp, pv50_inst) if raw_p10 is not None else pv50_inst * 0.7)
+                try:
+                    stamp = datetime.strptime(ts, "%Y-%m-%dT%H:%M")
+                    stamp = stamp.replace(tzinfo=pytz.utc)
+                except (ValueError, TypeError):
+                    continue
+                instant_kw[stamp] = (pv50_inst, pv10_inst)
+                instant_stamps.append(stamp)
+
+            # Pass 2: trapezoidal integration — energy over [T, T+1h] = 0.5*(kW_at_T + kW_at_T+1h).
+            # This correctly accounts for sunrise/sunset transitions where irradiance changes rapidly
+            # within the hour, e.g. the first post-sunrise hour contains only partial sunshine.
+            for i in range(len(instant_stamps) - 1):
+                stamp = instant_stamps[i]
+                next_stamp = instant_stamps[i + 1]
+                if (next_stamp - stamp) != timedelta(hours=1):
+                    continue
+                pv50_start, pv10_start = instant_kw[stamp]
+                pv50_end, pv10_end = instant_kw[next_stamp]
+                pv50 = dp4(0.5 * (pv50_start + pv50_end))
+                pv10 = dp4(0.5 * (pv10_start + pv10_end))
+
+                # Apply per-month site shading correction from Google Solar API if available
+                if shading_factors and len(shading_factors) == 12:
+                    shading_month = shading_factors[stamp.month - 1]
+                    pv50 = dp4(pv50 * shading_month)
+                    pv10 = dp4(pv10 * shading_month)
+
+                data_item = {"period_start": stamp.strftime(TIME_FORMAT), "pv_estimate": pv50, "pv_estimate10": pv10}
+                if stamp in period_data:
+                    period_data[stamp]["pv_estimate"] = dp4(period_data[stamp]["pv_estimate"] + pv50)
+                    period_data[stamp]["pv_estimate10"] = dp4(period_data[stamp]["pv_estimate10"] + pv10)
+                else:
+                    period_data[stamp] = data_item
+
+        sorted_data = []
+        if period_data:
+            for key in sorted(period_data.keys()):
+                sorted_data.append(period_data[key])
+
+        self.log("Open-Meteo returned {} data points".format(len(sorted_data)))
+        return sorted_data, max_kwh
+
     async def download_forecast_solar_data(self):
         """
         Download forecast.solar data directly from a URL or return from cache if recent.
         """
         cache_path = self.config_root + "/cache"
+        if not os.path.exists(cache_path):
+            os.makedirs(cache_path)
 
         self.forecast_solar_data = {}
         cache_file = cache_path + "/forecast_solar.json"
@@ -225,8 +453,8 @@ class SolarAPI(ComponentBase):
             lat = config.get("latitude", 51.5072)
             lon = config.get("longitude", -0.1276)
             postcode = config.get("postcode", None)
-            dec = config.get("declination", 45.0)
-            az = config.get("azimuth", 45.0)
+            dec = config.get("declination", 35.0)
+            az = config.get("azimuth", 180.0)
             az = self.convert_azimuth(az)  # Convert azimuth to degrees if needed
             kwp = config.get("kwp", 3.0)
             efficiency = config.get("efficiency", 0.95)
@@ -236,6 +464,9 @@ class SolarAPI(ComponentBase):
 
             if postcode:
                 result = await self.cache_get_url("https://api.postcodes.io/postcodes/{}".format(postcode), params={}, max_age=24 * 60 * 30)  # Cache postcode data for 30 days
+                if not result:
+                    self.log("Warn: Postcode {} could not be resolved, no postcode lookup data available".format(postcode))
+                    result = {}
                 result = result.get("result", {})
                 if "longitude" not in result or "latitude" not in result:
                     self.log("Warn: Postcode {} could not be resolved to latitude and longitude, using default".format(postcode))
@@ -254,6 +485,9 @@ class SolarAPI(ComponentBase):
                 days_data = config.get("days", 2)
 
             data = await self.cache_get_url(url, params={}, max_age=self.forecast_solar_max_age * 60)
+            if not data:
+                self.log("Warn: Forecast Solar data for lat {} lon {} could not be downloaded, check your Forecast Solar cloud settings".format(lat, lon))
+                continue
             watts = data.get("result", {}).get("watts", {})
             info = data.get("message", {}).get("info", {})
             if not watts or not info:
@@ -574,6 +808,8 @@ class SolarAPI(ComponentBase):
                 }
                 forecast_day[day].append(fentry)
 
+        calibration_on = self.get_arg("metric_pv_calibration_enable", default=True)
+
         days = min(days, 7)
         for day in range(days):
             if day == 0:
@@ -591,7 +827,7 @@ class SolarAPI(ComponentBase):
                 )
                 self.dashboard_item(
                     "sensor." + self.prefix + "_pv_today",
-                    state=dp2(total_day[day]),
+                    state=dp2(total_dayCL[day] if calibration_on else total_day[day]),
                     attributes={
                         "friendly_name": "PV Forecast Today",
                         "state_class": "measurement",
@@ -608,20 +844,27 @@ class SolarAPI(ComponentBase):
                         "remainingCL": dp2(total_left_todayCL),
                         "detailedForecast": forecast_day[day],
                     },
+                    app="solar",
                 )
                 self.dashboard_item(
                     "sensor." + self.prefix + "_pv_forecast_h0",
-                    state=dp2(power_now),
+                    state=dp2(power_nowCL if calibration_on else power_now),
                     attributes={
                         "friendly_name": "PV Forecast Now",
                         "state_class": "measurement",
                         "unit_of_measurement": "kW",
                         "icon": "mdi:solar-power",
                         "device_class": "power",
+                        "now": dp2(power_now),
                         "now10": dp2(power_now10),
                         "now90": dp2(power_now90),
                         "nowCL": dp2(power_nowCL),
+                        "remaining": dp2(total_left_today),
+                        "remaining10": dp2(total_left_today10),
+                        "remaining90": dp2(total_left_today90),
+                        "remainingCL": dp2(total_left_todayCL),
                     },
+                    app="solar",
                 )
             else:
                 day_name = "tomorrow" if day == 1 else "d{}".format(day)
@@ -630,7 +873,7 @@ class SolarAPI(ComponentBase):
 
                 self.dashboard_item(
                     "sensor." + self.prefix + "_pv_" + day_name,
-                    state=dp2(total_day[day]),
+                    state=dp2(total_dayCL[day] if calibration_on else total_day[day]),
                     attributes={
                         "friendly_name": "PV Forecast " + day_name_long,
                         "state_class": "measurement",
@@ -643,14 +886,26 @@ class SolarAPI(ComponentBase):
                         "totalCL": dp2(total_dayCL[day]),
                         "detailedForecast": forecast_day[day],
                     },
+                    app="solar",
                 )
 
-    def pv_calibration(self, pv_forecast_minute, pv_forecast_minute10, pv_forecast_data, create_pv10, divide_by, max_kwh, forecast_days):
+    def pv_calibration(self, pv_forecast_minute, pv_forecast_minute10, pv_forecast_data, create_pv10, divide_by, max_kwh, forecast_days, period=None):
         """
         Perform PV calibration based on historical data and forecast data.
         This will adjust the forecast data based on historical PV production and forecast data.
         It will also create pv_estimate10 and pv_estimate90 data if create_pv10 is True.
         """
+        # If no period is given, default to the plan interval (backward-compatible for unit tests).
+        if period is None:
+            period = self.plan_interval_minutes
+        # Number of plan-interval slots that span one forecast entry period.
+        # For 30-min plan slots with a 60-min forecast (Open-Meteo) this is 2,
+        # for 30-min plan slots with a 30-min forecast (Solcast) this is 1.
+        # Use ceiling so partial forecast periods are fully covered rather than rounded down.
+        if period % self.plan_interval_minutes != 0:
+            self.log("Warn: PV calibration forecast period {} does not divide evenly into plan interval {} - using ceiling slot coverage".format(period, self.plan_interval_minutes))
+        slots_per_period = max(1, int(math.ceil(period / self.plan_interval_minutes)))
+
         self.log("PV Calibration: Fetching PV data for calibration")
 
         days = 7
@@ -723,18 +978,23 @@ class SolarAPI(ComponentBase):
                 pv_forecast_by_slot[slot] = dp4(pv_forecast_by_slot[slot] / pv_forecast_by_slot_count[slot])
 
         # Work out the scaling factor for the forecast based on the history, looking at each day and each slot, and find the best and worst case day to use as a guide for scaling the forecast.
+        # More recent days are weighted higher: weight = max(1.0 - 0.1 * (day - 1), 0.3)
+        # so day1=1.0, day2=0.9, day3=0.8 ... day7=0.4, day8+=0.3
         worst_day_scaling = 1.0
         best_day_scaling = 1.0
         average_day_scaling = 0
+        total_weight = 0.0
         for day in past_day_forecast:
             past_day_forecast[day] = dp4(past_day_forecast[day] / 60.0)  # Convert to kWh
             past_day_actual[day] = dp4(past_day_actual.get(day, 0) / 60.0)  # Convert to kWh
             scaling_factor = dp4(past_day_actual[day] / past_day_forecast[day] if past_day_forecast[day] > 0 else 1.0)
             worst_day_scaling = min(worst_day_scaling, scaling_factor)
             best_day_scaling = max(best_day_scaling, scaling_factor)
-            average_day_scaling += scaling_factor
-            self.log("PV Calibration: Past day {} had {} kWh of forecast PV, and actual {} kWh PV generation".format(day, dp2(past_day_forecast[day]), dp2(past_day_actual[day])))
-        average_day_scaling = dp4(average_day_scaling / len(past_day_forecast)) if past_day_forecast else 1.0
+            weight = max(1.0 - 0.1 * (day - 1), 0.3)
+            average_day_scaling += scaling_factor * weight
+            total_weight += weight
+            self.log("PV Calibration: Past day {} had {} kWh of forecast PV, and actual {} kWh PV generation (weight {})".format(day, dp2(past_day_forecast[day]), dp2(past_day_actual[day]), dp2(weight)))
+        average_day_scaling = dp4(average_day_scaling / total_weight) if past_day_forecast else 1.0
         average_day_scaling = min(max(average_day_scaling, 0.1), 2.0)
 
         # Now adjust worst and best day scaling through by average scaling so they are just a factor on the average day, and clamp to sensible values to prevent extreme outliers from causing crazy forecasts.
@@ -841,16 +1101,38 @@ class SolarAPI(ComponentBase):
             if period_start:
                 minutes_since_midnight = (datetime.strptime(period_start, TIME_FORMAT) - self.midnight_utc).total_seconds() / 60
                 slot = int(minutes_since_midnight / self.plan_interval_minutes) * self.plan_interval_minutes
-                calibrated = pv_estimateCL.get(slot, None)
-                calibrated10 = pv_estimate10.get(slot, None)
-                calibrated90 = pv_estimate90.get(slot, None)
+
+                # Sum all plan-interval slots that fall within this forecast entry's period.
+                # When the forecast resolution is coarser than plan_interval_minutes (e.g. 60-min
+                # Open-Meteo entries with 30-min plan slots) we must accumulate multiple slots so
+                # that the annotated value covers the full entry duration, not just the first half.
+                calibrated = 0
+                calibrated10 = 0
+                calibrated90 = 0
+                has_calibrated = False
+                has_calibrated10 = False
+                has_calibrated90 = False
+                for i in range(slots_per_period):
+                    s = slot + i * self.plan_interval_minutes
+                    v = pv_estimateCL.get(s, None)
+                    if v is not None:
+                        calibrated += v
+                        has_calibrated = True
+                    v10 = pv_estimate10.get(s, None)
+                    if v10 is not None:
+                        calibrated10 += v10
+                        has_calibrated10 = True
+                    v90 = pv_estimate90.get(s, None)
+                    if v90 is not None:
+                        calibrated90 += v90
+                        has_calibrated90 = True
 
                 # When we store the data we have to reverse the divide_by factor
-                if calibrated is not None:
+                if has_calibrated:
                     entry["pv_estimateCL"] = calibrated * divide_by
-                if create_pv10 and (calibrated10 is not None):
+                if create_pv10 and has_calibrated10:
                     entry["pv_estimate10"] = calibrated10 * divide_by
-                if create_pv10 and (calibrated90 is not None):
+                if create_pv10 and has_calibrated90:
                     entry["pv_estimate90"] = calibrated90 * divide_by
 
         # Creation of PV10 data using worst day scaling factor
@@ -900,6 +1182,7 @@ class SolarAPI(ComponentBase):
                 "device_class": "power",
                 "state_class": "measurement",
             },
+            app="solar",
         )
 
     async def fetch_pv_forecast(self):
@@ -918,6 +1201,11 @@ class SolarAPI(ComponentBase):
         if self.forecast_solar:
             self.log("Obtaining solar forecast from Forecast Solar API")
             pv_forecast_data, max_kwh = await self.download_forecast_solar_data()
+            divide_by = 30.0
+            create_pv10 = True
+        elif self.open_meteo_forecast:
+            self.log("Obtaining solar forecast from Open-Meteo API")
+            pv_forecast_data, max_kwh = await self.download_open_meteo_data()
             divide_by = 30.0
             create_pv10 = True
         elif self.solcast_host and self.solcast_api_key:
@@ -1006,7 +1294,7 @@ class SolarAPI(ComponentBase):
             )
 
             # Run calibration on the data
-            pv_forecast_minute, pv_forecast_minute10, pv_forecast_data = self.pv_calibration(pv_forecast_minute, pv_forecast_minute10, pv_forecast_data, create_pv10, divide_by / period, max_kwh, self.forecast_days)
+            pv_forecast_minute, pv_forecast_minute10, pv_forecast_data = self.pv_calibration(pv_forecast_minute, pv_forecast_minute10, pv_forecast_data, create_pv10, divide_by / period, max_kwh, self.forecast_days, period)
             self.publish_pv_stats(pv_forecast_data, divide_by / period, period)
             self.pack_and_store_forecast(pv_forecast_minute, pv_forecast_minute10)
             self.update_success_timestamp()

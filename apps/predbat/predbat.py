@@ -36,7 +36,7 @@ import pytz
 import requests
 import asyncio
 
-THIS_VERSION = "v8.36.3"
+THIS_VERSION = "v8.38.0"
 
 from download import predbat_update_move, predbat_update_download, check_install, resolve_predbat_repository, DEFAULT_PREDBAT_REPOSITORY
 from const import MINUTE_WATT
@@ -529,6 +529,7 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Fetch, Plan, Marginal, Exec
         self.battery_loss_discharge = 1.0
         self.inverter_loss = 1.0
         self.inverter_hybrid = True
+        self.pv_ac_limit = 0
         self.inverter_soc_reset = False
         self.inverter_set_charge_before = True
         self.best_soc_min = 0
@@ -588,6 +589,7 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Fetch, Plan, Marginal, Exec
         self.battery_rate_max_charge = 0
         self.battery_rate_max_charge_dc = 0
         self.battery_rate_max_discharge = 0
+        self.battery_rate_max_export = 0
         self.battery_rate_min = 0
         self.battery_rate_max_scaling = 1.0
         self.battery_rate_max_scaling_discharge = 1.0
@@ -707,7 +709,6 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Fetch, Plan, Marginal, Exec
         self.alert_active_keep = {}
         self.manual_soc_keep = {}
         self.all_active_keep = {}
-        self.calculate_tweak_plan = False
         self.set_charge_low_power = False
         self.set_export_low_power = False
         self.config_root = "./"
